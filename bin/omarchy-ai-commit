@@ -3,10 +3,14 @@
 # Commit every git repo with uncommitted changes, with a commit message written
 # by Claude from the repo's own diff.
 #
-#   omarchy-ai-commit            commit all dirty repos (what the bar button runs)
-#   omarchy-ai-commit --dry-run  print the messages Claude would write, commit nothing
-#   omarchy-ai-commit --list     list the dirty repos
-#   omarchy-ai-commit --status   JSON for the bar widget: {"dirty":N,"running":bool,"repos":[...]}
+#   omarchy-ai-commit                 commit all dirty repos (the bar button's left click)
+#   omarchy-ai-commit --dry-run       print the messages Claude would write, commit nothing
+#   omarchy-ai-commit --plan          the same as JSON, for the preview panel
+#   omarchy-ai-commit --commit-plan J commit with the messages in J: [{"repo","message"}]
+#   omarchy-ai-commit --push          push every repo with commits GitHub doesn't have yet
+#   omarchy-ai-commit --undo          take back the last run's commits, keeping the changes
+#   omarchy-ai-commit --list          list the dirty repos
+#   omarchy-ai-commit --status        JSON for the bar widget
 #
 # Settings live in ~/.config/omarchy/ai-commit.conf (see ai-commit.conf.example).
 
@@ -203,9 +207,11 @@ generate_message() {
 
 # --- Committing one repo -----------------------------------------------------
 
-# Stages into a copy of the index so a failure leaves the repo exactly as it was.
-commit_repo() {
-  local repo="$1" backend="$2" dry_run="$3" index real_index message pathspec=()
+# Stage everything except EXCLUDE_PATHS into a copy of the index, so nothing
+# touches the repo until the commit itself. Prints the copy's path; exits 2
+# when there is nothing to commit.
+stage_copy() {
+  local repo="$1" index real_index pathspec=()
 
   real_index=$(git -C "$repo" rev-parse --path-format=absolute --git-path index)
   index=$(mktemp)
@@ -217,23 +223,41 @@ commit_repo() {
     echo "could not stage changes"
     return 1
   fi
-
   if GIT_INDEX_FILE="$index" git -C "$repo" diff --cached --quiet; then
     rm -f "$index"
     echo "only excluded files changed"
     return 2
   fi
+  echo "$index"
+}
 
-  if ! message=$(generate_message "$repo" "$index" "$backend"); then
+# Write a message without committing. Prints it; exits 1 or 2 with a reason.
+plan_repo() {
+  local repo="$1" backend="$2" index message status
+  index=$(stage_copy "$repo")
+  status=$?
+  ((status == 0)) || { echo "$index"; return $status; }
+
+  message=$(generate_message "$repo" "$index" "$backend")
+  status=$?
+  rm -f "$index"
+  ((status == 0)) || { echo "Claude did not return a message"; return 1; }
+  printf '%s\n' "$message"
+}
+
+# Commit with the given message, or one Claude writes when it is empty.
+# Prints the subject, then the new commit's id on a second line.
+commit_repo() {
+  local repo="$1" backend="$2" message="$3" index status
+
+  index=$(stage_copy "$repo")
+  status=$?
+  ((status == 0)) || { echo "$index"; return $status; }
+
+  if [[ -z $message ]] && ! message=$(generate_message "$repo" "$index" "$backend"); then
     rm -f "$index"
     echo "Claude did not return a message"
     return 1
-  fi
-
-  if [[ $dry_run == true ]]; then
-    rm -f "$index"
-    printf '%s\n' "$message"
-    return 0
   fi
 
   if ! GIT_INDEX_FILE="$index" git -C "$repo" commit -q -F - <<<"$message" >/dev/null 2>&1; then
@@ -246,60 +270,161 @@ commit_repo() {
   # Bring the real index in line with the new commit.
   git -C "$repo" reset -q
 
-  if [[ $PUSH == true ]] && git -C "$repo" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
-    git -C "$repo" push -q >/dev/null 2>&1 || { echo "$(head -n1 <<<"$message") (push failed)"; return 0; }
+  local subject
+  subject=$(head -n1 <<<"$message")
+  if [[ $PUSH == true ]] && ! push_repo "$repo" >/dev/null; then
+    subject+=" (push failed)"
   fi
+  printf '%s\n%s\n' "$subject" "$(git -C "$repo" rev-parse HEAD)"
+}
 
-  head -n1 <<<"$message"
+# --- Pushing -----------------------------------------------------------------
+
+# Commits on the current branch that no remote has yet. Prints nothing for a
+# repo with no remote, no commits, or a detached HEAD.
+unpushed_count() {
+  local repo="$1" count
+  git -C "$repo" symbolic-ref -q HEAD >/dev/null || return 0
+  git -C "$repo" rev-parse -q --verify HEAD >/dev/null || return 0
+  [[ -n $(git -C "$repo" remote) ]] || return 0
+  count=$(git -C "$repo" rev-list --count HEAD --not --remotes 2>/dev/null) || return 0
+  ((count > 0)) && echo "$count"
+  return 0
+}
+
+unpushed_repos() {
+  local repo
+  while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    matches_remote "$repo" && [[ -n $(unpushed_count "$repo") ]] && printf '%s\n' "$repo"
+  done < <(find_repos)
+}
+
+# Push the current branch: to its upstream, or to origin (or the only remote)
+# with the upstream set when it has none yet. Never prompts for credentials.
+push_repo() {
+  local repo="$1" remote
+  if git -C "$repo" rev-parse -q --verify '@{upstream}' >/dev/null 2>&1; then
+    GIT_TERMINAL_PROMPT=0 git -C "$repo" push -q 2>&1
+  else
+    remote=$(git -C "$repo" remote | grep -x origin || git -C "$repo" remote | head -n1)
+    GIT_TERMINAL_PROMPT=0 git -C "$repo" push -q -u "$remote" HEAD 2>&1
+  fi
+}
+
+# --- Undo --------------------------------------------------------------------
+
+# The last committing run's commits, one "repo<TAB>commit" per line.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-ai-commit"
+UNDO_FILE="$STATE_DIR/last-run"
+
+record_run() {
+  (($# == 0)) && return 0
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$@" >"$UNDO_FILE"
+}
+
+# Why a recorded commit can't be undone, or nothing when it can.
+undo_blocker() {
+  local repo="$1" commit="$2"
+  [[ -d $repo ]] || { echo "repo is gone"; return; }
+  [[ $(git -C "$repo" rev-parse -q --verify HEAD 2>/dev/null) == "$commit" ]] || { echo "it has newer commits"; return; }
+  [[ -z $(git -C "$repo" branch -r --contains "$commit" 2>/dev/null) ]] || { echo "already pushed"; return; }
+}
+
+undoable_count() {
+  local repo commit count=0
+  [[ -f $UNDO_FILE ]] || { echo 0; return; }
+  while IFS=$'\t' read -r repo commit; do
+    [[ -n $repo && -z $(undo_blocker "$repo" "$commit") ]] && ((count++))
+  done <"$UNDO_FILE"
+  echo "$count"
+}
+
+# Move the branch back one commit and keep the changes in the working tree,
+# uncommitted, as they were before the run.
+undo_repo() {
+  local repo="$1" commit="$2" blocker
+  blocker=$(undo_blocker "$repo" "$commit")
+  [[ -z $blocker ]] || { echo "$blocker"; return 2; }
+
+  if git -C "$repo" rev-parse -q --verify "$commit^" >/dev/null; then
+    git -C "$repo" reset -q "$commit^" || { echo "git reset failed"; return 1; }
+  else
+    # The repo's first commit: drop it and unstage everything again.
+    git -C "$repo" update-ref -d HEAD && git -C "$repo" rm -r -q --cached . >/dev/null \
+      || { echo "git reset failed"; return 1; }
+  fi
 }
 
 # --- Modes -------------------------------------------------------------------
 
-status_json() {
-  local running=false repos=()
-  [[ -e $RUNNING_FILE ]] && running=true
-  mapfile -t repos < <(dirty_repos)
-  printf '{"dirty":%d,"running":%s,"repos":%s}\n' "${#repos[@]}" "$running" \
-    "$(printf '%s\n' "${repos[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+to_json_array() {
+  jq -Rsc 'split("\n") | map(select(length > 0))'
 }
 
-run_all() {
-  local dry_run="$1" backend repos=() repo name result status
-  local committed=() skipped=() failed=()
+status_json() {
+  local running=false dirty=() unpushed=() undo=0 undo_time=0
+  [[ -e $RUNNING_FILE ]] && running=true
+  mapfile -t dirty < <(dirty_repos)
+  mapfile -t unpushed < <(unpushed_repos)
+  undo=$(undoable_count)
+  ((undo > 0)) && undo_time=$(stat -c %Y "$UNDO_FILE")
+  jq -nc --argjson running "$running" \
+    --argjson repos "$(printf '%s\n' "${dirty[@]}" | to_json_array)" \
+    --argjson unpushedRepos "$(printf '%s\n' "${unpushed[@]}" | to_json_array)" \
+    --argjson undo "$undo" --argjson undoTime "$undo_time" '{
+      dirty: ($repos | length), running: $running, repos: $repos,
+      unpushed: ($unpushedRepos | length), unpushedRepos: $unpushedRepos,
+      undo: $undo, undoTime: $undoTime
+    }'
+}
 
-  # The widget shows "committing" from the click on; every exit tells it to look again.
-  trap refresh_widget EXIT
-
+require_tools() {
+  local cmd
   for cmd in git jq flock; do
     command -v "$cmd" >/dev/null 2>&1 || { notify "AI Commit" "$cmd is not installed"; echo "$cmd is not installed" >&2; exit 1; }
   done
+}
 
-  backend=$(pick_backend)
-  if [[ $backend == none ]]; then
+require_backend() {
+  BACKEND=$(pick_backend)
+  if [[ $BACKEND == none ]]; then
     notify "AI Commit needs Claude" "Install Claude Code (omarchy default agent claude) or set ANTHROPIC_API_KEY."
     echo "No AI backend: install Claude Code or set ANTHROPIC_API_KEY" >&2
     exit 1
   fi
+}
 
+# One change to the repos at a time. While it runs the bar shows "working",
+# and every exit tells the widget to look again.
+take_lock() {
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
     notify "AI Commit is already running"
     exit 0
   fi
-
-  [[ $dry_run == true ]] || { touch "$RUNNING_FILE"; refresh_widget; }
+  touch "$RUNNING_FILE"
   trap 'rm -f "$RUNNING_FILE"; refresh_widget' EXIT
+  refresh_widget
+}
 
-  mapfile -t repos < <(dirty_repos)
-  if ((${#repos[@]} == 0)); then
-    notify "Nothing to commit" "Every repo is clean."
-    echo "Nothing to commit."
-    exit 0
+summarize() {
+  local verb="$1" done_count="$2" fail_count="$3" summary="$4"
+  if ((fail_count)); then
+    notify "$verb $done_count, failed $fail_count" "$summary"
+    return 1
   fi
+  notify "$verb $done_count repo(s)" "$summary"
+}
 
-  [[ $dry_run == true ]] || notify "Committing ${#repos[@]} repo(s)…" "Claude is writing the messages."
-
-  for repo in "${repos[@]}"; do
+# Commit the given repos: "repo<TAB>message" lines on stdin, where an empty
+# message means Claude writes one.
+commit_many() {
+  local repo message name result status committed=() skipped=() failed=() undo=()
+  while IFS=$'\t' read -r repo message; do
+    [[ -n $repo ]] || continue
+    message=$(printf '%b' "$message")
     name=$(basename "$repo")
     if result=$(busy_reason "$repo") && [[ -n $result ]]; then
       skipped+=("$name: $result")
@@ -307,16 +432,13 @@ run_all() {
       continue
     fi
 
-    result=$(commit_repo "$repo" "$backend" "$dry_run")
+    result=$(commit_repo "$repo" "${BACKEND:-none}" "$message")
     status=$?
     case $status in
       0)
         committed+=("$name: $(head -n1 <<<"$result")")
-        if [[ $dry_run == true ]]; then
-          printf '== %s ==\n%s\n\n' "$repo" "$result"
-        else
-          echo "✓ $name: $result"
-        fi
+        undo+=("$repo"$'\t'"$(tail -n1 <<<"$result")")
+        echo "✓ $name: $(head -n1 <<<"$result")"
         ;;
       2)
         skipped+=("$name: $result")
@@ -329,25 +451,172 @@ run_all() {
     esac
   done
 
-  [[ $dry_run == true ]] && exit 0
+  record_run "${undo[@]}"
 
   local summary=""
   ((${#committed[@]})) && summary+=$(printf '%s\n' "${committed[@]}")$'\n'
   ((${#skipped[@]})) && summary+=$(printf 'skipped %s\n' "${skipped[@]}")$'\n'
   ((${#failed[@]})) && summary+=$(printf 'failed %s\n' "${failed[@]}")$'\n'
+  summarize "Committed" "${#committed[@]}" "${#failed[@]}" "$summary"
+}
 
-  if ((${#failed[@]})); then
-    notify "Committed ${#committed[@]}, failed ${#failed[@]}" "$summary"
-    exit 1
+# Left click without preview: commit everything, Claude writing each message.
+run_all() {
+  local repos=()
+  trap refresh_widget EXIT
+  require_tools
+  require_backend
+  take_lock
+
+  mapfile -t repos < <(dirty_repos)
+  if ((${#repos[@]} == 0)); then
+    notify "Nothing to commit" "Every repo is clean."
+    echo "Nothing to commit."
+    exit 0
   fi
-  notify "Committed ${#committed[@]} repo(s)" "$summary"
+
+  notify "Committing ${#repos[@]} repo(s)…" "Claude is writing the messages."
+  printf '%s\t\n' "${repos[@]}" | commit_many
+}
+
+# The preview: Claude's message for every dirty repo, as JSON, committing nothing.
+#   {"error": null, "repos": [{"repo", "name", "message", "error"}]}
+plan_json() {
+  local repo name result status
+  require_tools
+  BACKEND=$(pick_backend)
+  if [[ $BACKEND == none ]]; then
+    jq -nc '{error: "Install Claude Code (omarchy default agent claude) or set ANTHROPIC_API_KEY.", repos: []}'
+    return 0
+  fi
+
+  while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    name=$(basename "$repo")
+    if result=$(busy_reason "$repo") && [[ -n $result ]]; then
+      status=2
+    else
+      result=$(plan_repo "$repo" "$BACKEND")
+      status=$?
+    fi
+    if ((status == 0)); then
+      jq -nc --arg repo "$repo" --arg name "$name" --arg message "$result" \
+        '{repo: $repo, name: $name, message: $message, error: null}'
+    else
+      jq -nc --arg repo "$repo" --arg name "$name" --arg error "$result" \
+        '{repo: $repo, name: $name, message: "", error: $error}'
+    fi
+  done < <(dirty_repos) | jq -sc '{error: null, repos: .}'
+}
+
+# The preview's Commit button: [{"repo", "message"}] from the panel. Only repos
+# that are still dirty are committed, each with exactly the message given.
+commit_plan() {
+  local plan="$1" dirty=() lines
+  trap refresh_widget EXIT
+  require_tools
+  jq -e 'type == "array"' <<<"$plan" >/dev/null 2>&1 || { echo "--commit-plan takes a JSON array" >&2; exit 1; }
+  take_lock
+
+  mapfile -t dirty < <(dirty_repos)
+  lines=$(jq -r --argjson dirty "$(printf '%s\n' "${dirty[@]}" | to_json_array)" '
+    .[] | select(.repo as $r | $dirty | index($r)) | select((.message // "") | test("\\S"))
+    | "\(.repo)\t\(.message | gsub("\\\\"; "\\\\") | gsub("\n"; "\\n") | gsub("\t"; "    "))"
+  ' <<<"$plan")
+  if [[ -z $lines ]]; then
+    notify "Nothing to commit" "None of the selected repos still have changes."
+    exit 0
+  fi
+  commit_many <<<"$lines"
+}
+
+push_all() {
+  local repos=() repo name result pushed=() failed=()
+  trap refresh_widget EXIT
+  require_tools
+  take_lock
+
+  mapfile -t repos < <(unpushed_repos)
+  if ((${#repos[@]} == 0)); then
+    notify "Nothing to push" "Every repo is up to date with GitHub."
+    echo "Nothing to push."
+    exit 0
+  fi
+
+  for repo in "${repos[@]}"; do
+    name=$(basename "$repo")
+    if result=$(push_repo "$repo"); then
+      pushed+=("$name")
+      echo "✓ $name pushed"
+    else
+      failed+=("$name: $(tail -n1 <<<"$result")")
+      echo "✗ $name: $result" >&2
+    fi
+  done
+
+  local summary=""
+  ((${#pushed[@]})) && summary+=$(printf '%s\n' "${pushed[@]}")$'\n'
+  ((${#failed[@]})) && summary+=$(printf 'failed %s\n' "${failed[@]}")$'\n'
+  summarize "Pushed" "${#pushed[@]}" "${#failed[@]}" "$summary"
+}
+
+undo_last_run() {
+  local repo commit name result status undone=() skipped=() failed=()
+  trap refresh_widget EXIT
+  require_tools
+  take_lock
+
+  if [[ ! -f $UNDO_FILE ]]; then
+    notify "Nothing to undo" "There is no AI Commit run to take back."
+    echo "Nothing to undo."
+    exit 0
+  fi
+
+  while IFS=$'\t' read -r repo commit; do
+    [[ -n $repo ]] || continue
+    name=$(basename "$repo")
+    result=$(undo_repo "$repo" "$commit")
+    status=$?
+    case $status in
+      0) undone+=("$name"); echo "✓ $name: commit undone" ;;
+      2) skipped+=("$name: $result"); echo "- $name: kept ($result)" ;;
+      *) failed+=("$name: $result"); echo "✗ $name: $result" >&2 ;;
+    esac
+  done <"$UNDO_FILE"
+  rm -f "$UNDO_FILE"
+
+  local summary=""
+  ((${#undone[@]})) && summary+=$(printf '%s\n' "${undone[@]}")$'\n'
+  ((${#skipped[@]})) && summary+=$(printf 'kept %s\n' "${skipped[@]}")$'\n'
+  ((${#failed[@]})) && summary+=$(printf 'failed %s\n' "${failed[@]}")$'\n'
+  summarize "Undid commits in" "${#undone[@]}" "${#failed[@]}" "$summary"
+}
+
+dry_run() {
+  local repo result
+  require_tools
+  require_backend
+  while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    if result=$(busy_reason "$repo") && [[ -n $result ]]; then
+      echo "- $(basename "$repo"): skipped ($result)"
+    elif result=$(plan_repo "$repo" "$BACKEND"); then
+      printf '== %s ==\n%s\n\n' "$repo" "$result"
+    else
+      echo "- $(basename "$repo"): $result"
+    fi
+  done < <(dirty_repos)
 }
 
 case "${1:-}" in
   --status) status_json ;;
   --list) dirty_repos ;;
-  --dry-run) run_all true ;;
-  "" | --run) run_all false ;;
-  -h | --help) sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+  --dry-run) dry_run ;;
+  --plan) plan_json ;;
+  --commit-plan) commit_plan "${2:-}" ;;
+  --push) push_all ;;
+  --undo) undo_last_run ;;
+  "" | --run) run_all ;;
+  -h | --help) sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) echo "Unknown option: $1 (try --help)" >&2; exit 1 ;;
 esac

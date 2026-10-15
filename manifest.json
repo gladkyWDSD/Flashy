@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "gladkywdsd.ai-commit",
   "name": "AI Commit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "gladkyWDSD",
-  "description": "One bar button that commits every git repo with unsaved changes, with commit messages written by Claude",
+  "description": "One bar button that commits every git repo with unsaved changes, with commit messages written by Claude. Preview and edit the messages, push, and undo from its panel.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,15 +13,23 @@
   },
   "barWidget": {
     "displayName": "AI Commit",
-    "description": "Click to commit every dirty git repo with a Claude-written message. Right-click for a dry run.",
+    "description": "Click to commit every dirty git repo with a Claude-written message. Right-click to preview, push, or undo.",
     "category": "AI",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 300,
-      "hideWhenClean": false
+      "hideWhenClean": false,
+      "preview": false
     },
     "schema": [
+      {
+        "key": "preview",
+        "type": "boolean",
+        "label": "Preview before committing",
+        "description": "A left click opens the panel with Claude's messages to check, edit, or untick before anything is committed.",
+        "defaultValue": false
+      },
       {
         "key": "refreshIntervalSec",
         "type": "integer",
