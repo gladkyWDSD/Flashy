@@ -1,0 +1,353 @@
+#!/bin/bash
+
+# Commit every git repo with uncommitted changes, with a commit message written
+# by Claude from the repo's own diff.
+#
+#   omarchy-ai-commit            commit all dirty repos (what the bar button runs)
+#   omarchy-ai-commit --dry-run  print the messages Claude would write, commit nothing
+#   omarchy-ai-commit --list     list the dirty repos
+#   omarchy-ai-commit --status   JSON for the bar widget: {"dirty":N,"running":bool,"repos":[...]}
+#
+# Settings live in ~/.config/omarchy/ai-commit.conf (see ai-commit.conf.example).
+
+set -uo pipefail
+
+PLUGIN_ID="gladkywdsd.ai-commit"
+CONFIG_FILE="${OMARCHY_AI_COMMIT_CONFIG:-$HOME/.config/omarchy/ai-commit.conf}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+LOCK_FILE="$RUNTIME_DIR/omarchy-ai-commit.lock"
+RUNNING_FILE="$RUNTIME_DIR/omarchy-ai-commit.running"
+
+# Defaults, overridable in the config file (or the environment, for scalars).
+SCAN_DIRS=("$HOME/Code" "$HOME/Projects" "$HOME/Work" "$HOME/src" "$HOME/dev" "$HOME/repos" "$HOME/git" "$HOME/Developer")
+EXCLUDE_PATHS=(".env" ".env.*" "*.pem" "*.key" "id_rsa*" "id_ed25519*")
+MAX_DEPTH="${MAX_DEPTH:-4}"
+REMOTE_FILTER="${REMOTE_FILTER-github.com}"
+AI_BACKEND="${AI_BACKEND:-auto}"
+MODEL="${MODEL:-claude-opus-5-5}"
+EFFORT="${EFFORT:-low}"
+MAX_DIFF_CHARS="${MAX_DIFF_CHARS:-400000}"
+PUSH="${PUSH:-false}"
+
+# shellcheck source=/dev/null
+[[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
+
+notify() {
+  local headline="$1" description="${2:-}"
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send --app-name "AI Commit" -g "󰊢" "$headline" "$description" >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "AI Commit" "$headline" "$description" >/dev/null 2>&1 || true
+  fi
+}
+
+refresh_widget() {
+  command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell -q "$PLUGIN_ID" refresh >/dev/null 2>&1
+  return 0
+}
+
+# --- Finding repos -----------------------------------------------------------
+
+find_repos() {
+  local dir
+  for dir in "${SCAN_DIRS[@]}"; do
+    [[ -d $dir ]] || continue
+    # A .git file (worktrees, submodules) counts as well as a .git dir.
+    find "$dir" -maxdepth "$MAX_DEPTH" \( -name node_modules -o -name .cache -o -name vendor \) -prune \
+      -o -name .git -print 2>/dev/null
+  done | sed 's|/\.git$||' | sort -u
+}
+
+matches_remote() {
+  local repo="$1"
+  [[ -z $REMOTE_FILTER ]] && return 0
+  git -C "$repo" remote -v 2>/dev/null | grep -qF "$REMOTE_FILTER"
+}
+
+# Files matching EXCLUDE_PATHS are never committed, so they don't make a repo dirty.
+exclude_pathspec() {
+  local pattern
+  printf '%s\n' .
+  for pattern in "${EXCLUDE_PATHS[@]}"; do
+    printf '%s\n' ":(exclude,glob)**/$pattern"
+  done
+}
+
+is_dirty() {
+  local pathspec=()
+  mapfile -t pathspec < <(exclude_pathspec)
+  [[ -n $(git --no-optional-locks -C "$1" status --porcelain -- "${pathspec[@]}" 2>/dev/null | head -n1) ]]
+}
+
+dirty_repos() {
+  local repo
+  while IFS= read -r repo; do
+    [[ -n $repo ]] || continue
+    matches_remote "$repo" && is_dirty "$repo" && printf '%s\n' "$repo"
+  done < <(find_repos)
+}
+
+# Mid-merge, mid-rebase, and detached HEADs are left for a human.
+busy_reason() {
+  local repo="$1" git_dir
+  git_dir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null) || { echo "not a git repo"; return; }
+  [[ -e $git_dir/MERGE_HEAD ]] && { echo "merge in progress"; return; }
+  [[ -d $git_dir/rebase-merge || -d $git_dir/rebase-apply ]] && { echo "rebase in progress"; return; }
+  [[ -e $git_dir/CHERRY_PICK_HEAD ]] && { echo "cherry-pick in progress"; return; }
+  [[ -e $git_dir/REVERT_HEAD ]] && { echo "revert in progress"; return; }
+  git -C "$repo" symbolic-ref -q HEAD >/dev/null || { echo "detached HEAD"; return; }
+}
+
+# --- Asking Claude -----------------------------------------------------------
+
+PROMPT='You write git commit messages. Below is the staged diff of a repository, plus its recent commit subjects so you can match their style.
+
+Write one commit message for the whole change:
+- A subject line of at most 72 characters, in the imperative mood ("Add", "Fix", "Update"), with no trailing period. Follow the conventions of the recent subjects (for example Conventional Commits prefixes) when they use one.
+- If the change is more than trivial, a blank line and then a short body that says what changed and why, wrapped at 72 characters.
+
+Reply with the commit message only: no preamble, no quotes, no code fences.'
+
+pick_backend() {
+  case "$AI_BACKEND" in
+    claude | api) echo "$AI_BACKEND" ;;
+    *)
+      if command -v claude >/dev/null 2>&1; then echo claude
+      elif [[ -n ${ANTHROPIC_API_KEY:-} ]]; then echo api
+      else echo none
+      fi
+      ;;
+  esac
+}
+
+ask_claude_cli() {
+  # Run from an empty directory with no tools so the CLI only sees the input.
+  local input_file="$1" workdir
+  workdir=$(mktemp -d)
+  (cd "$workdir" && claude -p "$PROMPT" --model "$MODEL" --effort "$EFFORT" --tools "" \
+    --no-session-persistence --output-format text <"$input_file")
+  local status=$?
+  rm -rf "$workdir"
+  return $status
+}
+
+ask_claude_api() {
+  local input_file="$1" body response stop_reason
+  [[ -n ${ANTHROPIC_API_KEY:-} ]] || { echo "ANTHROPIC_API_KEY is not set" >&2; return 1; }
+
+  body=$(jq -n --arg model "$MODEL" --arg effort "$EFFORT" --arg prompt "$PROMPT" --rawfile input "$input_file" '{
+    model: $model,
+    max_tokens: 16000,
+    output_config: { effort: $effort },
+    fallbacks: "default",
+    messages: [{ role: "user", content: ($prompt + "\n\n" + $input) }]
+  }')
+
+  response=$(curl -sS --fail-with-body https://api.anthropic.com/v1/messages \
+    -H "content-type: application/json" \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "anthropic-beta: server-side-fallback-2026-07-01" \
+    --data-binary @- <<<"$body") || { jq -r '.error.message // .' <<<"$response" >&2; return 1; }
+
+  stop_reason=$(jq -r '.stop_reason' <<<"$response")
+  if [[ $stop_reason == "refusal" ]]; then
+    echo "Claude declined to write this message" >&2
+    return 1
+  fi
+  jq -r '[.content[] | select(.type == "text") | .text] | join("")' <<<"$response"
+}
+
+# Drop code fences a model might still add, and leading blank lines. The
+# caller's $(...) trims the trailing ones.
+clean_message() {
+  sed -e '/^```/d' | sed -e '/./,$!d'
+}
+
+generate_message() {
+  local repo="$1" index="$2" backend="$3" input_file diff truncated=""
+  input_file=$(mktemp)
+
+  diff=$(GIT_INDEX_FILE="$index" git -C "$repo" diff --cached --no-color --no-ext-diff)
+  if ((${#diff} > MAX_DIFF_CHARS)); then
+    diff="${diff:0:MAX_DIFF_CHARS}"
+    truncated=$'\n\n[The diff was cut off here because it is very long. Base the message on the file summary above as well.]'
+  fi
+
+  {
+    echo "Repository: $(basename "$repo")"
+    echo
+    echo "Recent commit subjects:"
+    git -C "$repo" log -n 10 --format='- %s' 2>/dev/null || echo "(no commits yet)"
+    echo
+    echo "Files changed:"
+    GIT_INDEX_FILE="$index" git -C "$repo" diff --cached --stat --no-color
+    echo
+    echo "Diff:"
+    printf '%s%s\n' "$diff" "$truncated"
+  } >"$input_file"
+
+  local message status
+  case "$backend" in
+    claude) message=$(ask_claude_cli "$input_file") ;;
+    api) message=$(ask_claude_api "$input_file") ;;
+  esac
+  status=$?
+  rm -f "$input_file"
+  ((status == 0)) || return 1
+
+  message=$(clean_message <<<"$message")
+  [[ -n $message ]] || return 1
+  printf '%s\n' "$message"
+}
+
+# --- Committing one repo -----------------------------------------------------
+
+# Stages into a copy of the index so a failure leaves the repo exactly as it was.
+commit_repo() {
+  local repo="$1" backend="$2" dry_run="$3" index real_index message pathspec=()
+
+  real_index=$(git -C "$repo" rev-parse --path-format=absolute --git-path index)
+  index=$(mktemp)
+  if [[ -f $real_index ]]; then cp "$real_index" "$index"; else rm -f "$index"; fi
+
+  mapfile -t pathspec < <(exclude_pathspec)
+  if ! GIT_INDEX_FILE="$index" git -C "$repo" add -A -- "${pathspec[@]}" 2>/dev/null; then
+    rm -f "$index"
+    echo "could not stage changes"
+    return 1
+  fi
+
+  if GIT_INDEX_FILE="$index" git -C "$repo" diff --cached --quiet; then
+    rm -f "$index"
+    echo "only excluded files changed"
+    return 2
+  fi
+
+  if ! message=$(generate_message "$repo" "$index" "$backend"); then
+    rm -f "$index"
+    echo "Claude did not return a message"
+    return 1
+  fi
+
+  if [[ $dry_run == true ]]; then
+    rm -f "$index"
+    printf '%s\n' "$message"
+    return 0
+  fi
+
+  if ! GIT_INDEX_FILE="$index" git -C "$repo" commit -q -F - <<<"$message" >/dev/null 2>&1; then
+    rm -f "$index"
+    echo "git commit failed (a hook or signing?)"
+    return 1
+  fi
+  rm -f "$index"
+
+  # Bring the real index in line with the new commit.
+  git -C "$repo" reset -q
+
+  if [[ $PUSH == true ]] && git -C "$repo" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    git -C "$repo" push -q >/dev/null 2>&1 || { echo "$(head -n1 <<<"$message") (push failed)"; return 0; }
+  fi
+
+  head -n1 <<<"$message"
+}
+
+# --- Modes -------------------------------------------------------------------
+
+status_json() {
+  local running=false repos=()
+  [[ -e $RUNNING_FILE ]] && running=true
+  mapfile -t repos < <(dirty_repos)
+  printf '{"dirty":%d,"running":%s,"repos":%s}\n' "${#repos[@]}" "$running" \
+    "$(printf '%s\n' "${repos[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+}
+
+run_all() {
+  local dry_run="$1" backend repos=() repo name result status
+  local committed=() skipped=() failed=()
+
+  # The widget shows "committing" from the click on; every exit tells it to look again.
+  trap refresh_widget EXIT
+
+  for cmd in git jq flock; do
+    command -v "$cmd" >/dev/null 2>&1 || { notify "AI Commit" "$cmd is not installed"; echo "$cmd is not installed" >&2; exit 1; }
+  done
+
+  backend=$(pick_backend)
+  if [[ $backend == none ]]; then
+    notify "AI Commit needs Claude" "Install Claude Code (omarchy default agent claude) or set ANTHROPIC_API_KEY."
+    echo "No AI backend: install Claude Code or set ANTHROPIC_API_KEY" >&2
+    exit 1
+  fi
+
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    notify "AI Commit is already running"
+    exit 0
+  fi
+
+  [[ $dry_run == true ]] || { touch "$RUNNING_FILE"; refresh_widget; }
+  trap 'rm -f "$RUNNING_FILE"; refresh_widget' EXIT
+
+  mapfile -t repos < <(dirty_repos)
+  if ((${#repos[@]} == 0)); then
+    notify "Nothing to commit" "Every repo is clean."
+    echo "Nothing to commit."
+    exit 0
+  fi
+
+  [[ $dry_run == true ]] || notify "Committing ${#repos[@]} repo(s)…" "Claude is writing the messages."
+
+  for repo in "${repos[@]}"; do
+    name=$(basename "$repo")
+    if result=$(busy_reason "$repo") && [[ -n $result ]]; then
+      skipped+=("$name: $result")
+      echo "- $name: skipped ($result)"
+      continue
+    fi
+
+    result=$(commit_repo "$repo" "$backend" "$dry_run")
+    status=$?
+    case $status in
+      0)
+        committed+=("$name: $(head -n1 <<<"$result")")
+        if [[ $dry_run == true ]]; then
+          printf '== %s ==\n%s\n\n' "$repo" "$result"
+        else
+          echo "✓ $name: $result"
+        fi
+        ;;
+      2)
+        skipped+=("$name: $result")
+        echo "- $name: skipped ($result)"
+        ;;
+      *)
+        failed+=("$name: $result")
+        echo "✗ $name: $result" >&2
+        ;;
+    esac
+  done
+
+  [[ $dry_run == true ]] && exit 0
+
+  local summary=""
+  ((${#committed[@]})) && summary+=$(printf '%s\n' "${committed[@]}")$'\n'
+  ((${#skipped[@]})) && summary+=$(printf 'skipped %s\n' "${skipped[@]}")$'\n'
+  ((${#failed[@]})) && summary+=$(printf 'failed %s\n' "${failed[@]}")$'\n'
+
+  if ((${#failed[@]})); then
+    notify "Committed ${#committed[@]}, failed ${#failed[@]}" "$summary"
+    exit 1
+  fi
+  notify "Committed ${#committed[@]} repo(s)" "$summary"
+}
+
+case "${1:-}" in
+  --status) status_json ;;
+  --list) dirty_repos ;;
+  --dry-run) run_all true ;;
+  "" | --run) run_all false ;;
+  -h | --help) sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "Unknown option: $1 (try --help)" >&2; exit 1 ;;
+esac

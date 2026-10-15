@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "gladkywdsd.ai-commit",
+  "name": "AI Commit",
+  "version": "1.0.0",
+  "author": "gladkyWDSD",
+  "description": "One bar button that commits every git repo with unsaved changes, with commit messages written by Claude",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "AiCommit.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Commit",
+    "description": "Click to commit every dirty git repo with a Claude-written message. Right-click for a dry run.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "hideWhenClean": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      },
+      {
+        "key": "hideWhenClean",
+        "type": "boolean",
+        "label": "Hide when clean",
+        "description": "Hide the button while no repo has uncommitted changes.",
+        "defaultValue": false
+      }
+    ]
+  }
+}

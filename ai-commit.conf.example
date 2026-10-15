@@ -1,0 +1,28 @@
+# AI Commit settings. Copy to ~/.config/omarchy/ai-commit.conf and edit.
+# This file is sourced by bash, so use bash syntax.
+
+# Folders to search for git repos, and how deep to look inside each.
+SCAN_DIRS=("$HOME/Code" "$HOME/Projects" "$HOME/Work" "$HOME/src" "$HOME/dev" "$HOME/repos" "$HOME/git" "$HOME/Developer")
+MAX_DEPTH=4
+
+# Only commit repos with a remote containing this text. Set to "" to commit
+# every git repo, including ones with no remote.
+REMOTE_FILTER="github.com"
+
+# Files that are never committed, even if they are not in .gitignore.
+EXCLUDE_PATHS=(".env" ".env.*" "*.pem" "*.key" "id_rsa*" "id_ed25519*")
+
+# How to reach Claude:
+#   auto   - Claude Code CLI if installed (uses your Claude login), else the API
+#   claude - always the Claude Code CLI (`claude -p`)
+#   api    - always the Anthropic API, using ANTHROPIC_API_KEY
+AI_BACKEND="auto"
+MODEL="claude-opus-5-5"
+EFFORT="low"
+# ANTHROPIC_API_KEY="sk-ant-..."
+
+# Diffs longer than this many characters are cut off before they go to Claude.
+MAX_DIFF_CHARS=400000
+
+# Push each repo after committing, when it has an upstream branch.
+PUSH=false
